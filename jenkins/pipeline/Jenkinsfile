@@ -1,0 +1,190 @@
+pipeline {
+    agent any
+    
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        S3_BUCKET = 'your-bucket'
+        SAGEMAKER_ROLE = 'arn:aws:iam::xxxxxxxx:role/service-role/AmazonSageMaker-ExecutionRole'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Generate Synthetic Data') {
+            steps {
+                sh '''
+                    python -m pip install -r requirements.txt
+                    python data/generate_synthetic_data.py
+                '''
+            }
+        }
+        
+        stage('Upload Data to S3') {
+            steps {
+                sh '''
+                    aws s3 cp data/raw/train_data.csv s3://${S3_BUCKET}/data/raw/
+                    aws s3 cp data/raw/test_data.csv s3://${S3_BUCKET}/data/raw/
+                '''
+            }
+        }
+        
+        stage('Run Glue ETL Job') {
+            steps {
+                script {
+                    def glueJobName = 'fraud-detection-etl'
+                    def glueJobRunId = sh(
+                        script: """
+                            aws glue start-job-run \
+                                --job-name ${glueJobName} \
+                                --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Wait for job completion
+                    while (true) {
+                        def status = sh(
+                            script: """
+                                aws glue get-job-run \
+                                    --job-name ${glueJobName} \
+                                    --run-id ${glueJobRunId} \
+                                    --query 'JobRun.JobRunState' \
+                                    --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (status == 'SUCCEEDED') {
+                            break
+                        } else if (status == 'FAILED') {
+                            error 'Glue job failed'
+                        }
+                        
+                        sleep 60
+                    }
+                }
+            }
+        }
+        
+        stage('Train SageMaker Model') {
+            steps {
+                script {
+                    def autopilotJobName = 'fraud-detection-autopilot'
+                    def autopilotJobArn = sh(
+                        script: """
+                            aws sagemaker create-auto-ml-job \
+                                --auto-ml-job-name ${autopilotJobName} \
+                                --input-data-config '[{"DataSource":{"S3DataSource":{"S3DataType":"Parquet","S3Uri":"s3://${S3_BUCKET}/data/processed/"}},"TargetAttributeName":"is_fraud"}]' \
+                                --output-data-config '{"S3OutputPath":"s3://${S3_BUCKET}/models/autopilot/"}' \
+                                --role-arn ${SAGEMAKER_ROLE} \
+                                --problem-type BinaryClassification \
+                                --auto-ml-job-objective '{"MetricName":"AUC"}' \
+                                --auto-ml-job-config '{"CompletionCriteria":{"MaxCandidates":100,"MaxTimePerTrainingJobInSeconds":3600,"MaxAutoMLJobRuntimeInSeconds":86400}}' \
+                                --query 'AutoMLJobArn' \
+                                --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Wait for job completion
+                    while (true) {
+                        def status = sh(
+                            script: """
+                                aws sagemaker describe-auto-ml-job \
+                                    --auto-ml-job-name ${autopilotJobName} \
+                                    --query 'AutoMLJobStatus' \
+                                    --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (status == 'Completed') {
+                            break
+                        } else if (status == 'Failed') {
+                            error 'AutoML job failed'
+                        }
+                        
+                        sleep 300
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy Model') {
+            steps {
+                script {
+                    // Create model
+                    sh '''
+                        aws sagemaker create-model \
+                            --model-name fraud-detection-model \
+                            --execution-role-arn ${SAGEMAKER_ROLE} \
+                            --primary-container '{"Image":"683313688378.dkr.ecr.us-east-1.amazonaws.com/autopilot:1.0-cpu-py3","ModelDataUrl":"s3://${S3_BUCKET}/models/autopilot/best-candidate/"}'
+                    '''
+                    
+                    // Create endpoint configuration
+                    sh '''
+                        aws sagemaker create-endpoint-config \
+                            --endpoint-config-name fraud-detection-endpoint-config \
+                            --production-variants '[{"VariantName":"AllTraffic","ModelName":"fraud-detection-model","InstanceType":"ml.m5.xlarge","InitialInstanceCount":1}]'
+                    '''
+                    
+                    // Create endpoint
+                    sh '''
+                        aws sagemaker create-endpoint \
+                            --endpoint-name fraud-detection-endpoint \
+                            --endpoint-config-name fraud-detection-endpoint-config
+                    '''
+                    
+                    // Wait for endpoint to be ready
+                    while (true) {
+                        def status = sh(
+                            script: """
+                                aws sagemaker describe-endpoint \
+                                    --endpoint-name fraud-detection-endpoint \
+                                    --query 'EndpointStatus' \
+                                    --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (status == 'InService') {
+                            break
+                        } else if (status == 'Failed') {
+                            error 'Endpoint deployment failed'
+                        }
+                        
+                        sleep 60
+                    }
+                }
+            }
+        }
+        
+        stage('Run Tests') {
+            steps {
+                sh '''
+                    python -m pytest tests/
+                '''
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            emailext body: 'Pipeline completed successfully!',
+                     subject: 'Pipeline Success',
+                     to: 'your-email@example.com'
+        }
+        failure {
+            emailext body: 'Pipeline failed! Check the logs for details.',
+                     subject: 'Pipeline Failure',
+                     to: 'your-email@example.com'
+        }
+    }
+} 

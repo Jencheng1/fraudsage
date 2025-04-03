@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for FraudSage - Credit Card Fraud Detection System using SageMaker'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (e.g., dev, prod)
+  
+  BucketName:
+    Type: String
+    Default: fraudsage-data
+    Description: Name of the S3 bucket for data storage
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for VPC
+
+  SubnetCidr1:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for first subnet
+
+  SubnetCidr2:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for second subnet
+
+  SubnetCidr3:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR block for third subnet
+
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+    Description: First availability zone
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1b
+    Description: Second availability zone
+
+  AvailabilityZone3:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1c
+    Description: Third availability zone
+
+Resources:
+  # S3 Bucket for data storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Ref BucketName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket Encryption
+  DataBucketEncryption:
+    Type: AWS::S3::BucketEncryption
+    Properties:
+      Bucket: !Ref DataBucket
+      ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+
+  # IAM Role for SageMaker
+  SageMakerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub sagemaker-execution-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSageMakerFullAccess
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Policy for SageMaker
+  SageMakerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub sagemaker-policy-${Environment}
+      Roles:
+        - !Ref SageMakerRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${DataBucket}
+              - !Sub arn:aws:s3:::${DataBucket}/*
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub arn:aws:logs:*:*:*
+
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub sagemaker-vpc-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub sagemaker-igw-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Attach Internet Gateway to VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Subnets
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone1
+      CidrBlock: !Ref SubnetCidr1
+      Tags:
+        - Key: Name
+          Value: !Sub sagemaker-subnet-1-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone2
+      CidrBlock: !Ref SubnetCidr2
+      Tags:
+        - Key: Name
+          Value: !Sub sagemaker-subnet-2-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+
+  Subnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone3
+      CidrBlock: !Ref SubnetCidr3
+      Tags:
+        - Key: Name
+          Value: !Sub sagemaker-subnet-3-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+
+  # NAT Gateway
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref Subnet1
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub sagemaker-public-rt-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub sagemaker-private-rt-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # Security Group
+  SageMakerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for SageMaker endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub sagemaker-sg-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SageMaker Notebook Instance
+  SageMakerNotebook:
+    Type: AWS::SageMaker::NotebookInstance
+    Properties:
+      NotebookInstanceName: !Sub fraud-detection-notebook-${Environment}
+      RoleArn: !GetAtt SageMakerRole.Arn
+      InstanceType: ml.t3.medium
+      SubnetId: !Ref Subnet1
+      SecurityGroups:
+        - !Ref SageMakerSecurityGroup
+      DirectInternetAccess: false
+      Tags:
+        - Key: Name
+          Value: !Sub fraud-detection-notebook-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/sagemaker/fraud-detection-${Environment}
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  DataBucketName:
+    Description: Name of the S3 bucket
+    Value: !Ref DataBucket
+
+  SageMakerRoleArn:
+    Description: ARN of the SageMaker execution role
+    Value: !GetAtt SageMakerRole.Arn
+
+  SageMakerNotebookUrl:
+    Description: URL of the SageMaker notebook instance
+    Value: !Sub https://${SageMakerNotebook.NotebookInstanceName}.notebook.${AWS::Region}.sagemaker.aws
+
+  VpcId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+
+  SubnetIds:
+    Description: IDs of the subnets
+    Value: !Join 
+      - ','
+      - - !Ref Subnet1
+        - !Ref Subnet2
+        - !Ref Subnet3
+
+  SecurityGroupId:
+    Description: ID of the security group
+    Value: !Ref SageMakerSecurityGroup 
